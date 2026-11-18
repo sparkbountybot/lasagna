@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A generation experiment checks its judge before the first answer is written.**
+  `Experiment._run` and the CLI (`lasagna benchmark run`, `lasagna benchmark experiment`)
+  now validate the RAGAS judge once before corpus ingestion, checkpoint clearing, or
+  answer generation using its independent `RAG_EVAL_JUDGE_*` / `OPENAI_*`
+  configuration, while retrieval-only runs still do not probe the judge (#96).
+- Agentic reasoning and chunk-refinement LLM calls now honor the session's
+  `agent_temperature`, including shared and pinned loop models (#82). Previously,
+  `RAGConfig.agent_temperature` documented a default of `0.1` that never reached
+  any LLM call because models were built with the provider default (`0.0`). The
+  runtime default remains `0.0` so existing behavior does not silently change,
+  explicit session `agent_temperature` values now reach every reasoning and
+  chunk-refinement call, and adaptive complexity classification and CRAG
+  document grading remain deterministic at `0.0`.
 - **Four benchmarks load again, and a fifth says why it cannot.** `datasets`
   5, the version the release pins, refuses a Hub repository named without its
   owner, and since 4.0 it no longer runs loading scripts. `triviaqa`,
@@ -37,6 +50,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a default tier other than `comprehensive` (of the built-in profiles,
   `speed`): for agentic arms, and for a CRAG arm that turned on a stage the
   fast tier turns off, such as a reranker.
+- **An agentic arm's exact match and F1 score its own answer.** The
+  generation track has the harness's generator answer from the passages each
+  search returned, so arms are compared on the same generator. For an agentic
+  arm the loop writes an answer too, and the judged metrics already scored it
+  (`faithfulness` was the loop's answer, `faithfulness_regen` the harness's).
+  Exact match, token F1, ROUGE-L, containment, abstention and answer
+  similarity scored only the harness's answer, so one row judged two answers,
+  and `lasagna results significance -m exact_match` compared the harness's
+  answers, not the loops. They now follow the judged metrics: the unsuffixed
+  key is the loop's answer where it gave one, `_regen` keeps the harness's,
+  `_agentic` is the loop's alone, and the loop's answer is saved with the
+  trajectory and shown in `lasagna results view` beside the harness's. A
+  question the loop answered no longer counts in `generations_failed` when
+  the harness's generator wrote nothing; `generations_failed_regen` counts
+  those. Numbers move for agentic arms only, and the metrics version is now
+  1.8, so results from earlier builds do not share a comparability key with
+  new ones.
+- **Self-Ask answers with a reasoning model.** A reasoning model served with
+  its thinking split off (Ollama's `think`, on by default for Qwen3; vLLM's
+  reasoning parser) applies a stop sequence to its reasoning too, and any of
+  Self-Ask's stops can end a reply there. Qwen3's reasoning opens with
+  `<think>` and a newline, so the newline stop on the final-answer call (made
+  when the chain ends without a final answer, as every question did once it
+  used its five follow-ups) ended the reply after two tokens, and the loop
+  answered nothing. A loop step whose stops leave the reply empty is now asked
+  once more without them and cut by the loop, after any blank lines it opens
+  with; a reply that opens with one of Self-Ask's markers is still empty. A
+  model whose replies the stops do not empty makes the same calls as before.
+- **A CHANGELOG line lands under Unreleased.** A branch started before a
+  release merges cleanly, but its line then sits under that release, so the
+  release notes claim a change the release never had. The "PR quality" check
+  now reads CHANGELOG.md as it will be once merged and fails while an added
+  line sits under a released version; a maintainer adds `changelog-history`
+  to correct a released version's notes.
 
 ## [0.3.0] - 2026-11-07
 
