@@ -353,6 +353,7 @@ def test_an_experiment_says_it_once_and_records_it(anthropic_only, monkeypatch, 
     monkeypatch.setattr(providers, "get_llm_provider", lambda: provider)
     monkeypatch.setattr(ragas_evaluator, "RAGASEvaluator", _Judge)
     monkeypatch.setattr(exp, "_build_judge_llm", lambda *a, **k: None)
+    monkeypatch.setattr(exp, "_check_judge_llm", lambda *a, **k: None)
     monkeypatch.setenv("RAG_EVAL_SIMILARITY_MODEL", "none")
 
     logged = []
@@ -376,8 +377,12 @@ def test_an_experiment_says_it_once_and_records_it(anthropic_only, monkeypatch, 
 
     assert [m for m in logged if "does not accept temperature" in m] == [NOTE]
     sampling = results.experiment_config["sampling"]
-    assert sampling["generator"] == {"model": "claude-sonnet-5-5", "sampling": "provider-default"}
-    assert sampling["judge"] == {"model": "gpt-6-luna", "sampling": "pinned"}
+    assert sampling["generator"] == {
+        "model": "claude-sonnet-5-5",
+        "sampling": "provider-default",
+        "max_tokens": 1000,
+    }
+    assert sampling["judge"] == {"model": "gpt-6-luna", "sampling": "pinned", "max_tokens": 1024}
 
 
 # -- comparability ------------------------------------------------------------

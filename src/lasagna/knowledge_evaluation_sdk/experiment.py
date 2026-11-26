@@ -154,6 +154,7 @@ from lasagna.core.strict import (  # noqa: E402
     ContextPresentation,
     lost_in_the_middle,
     observe_reranking,
+    observe_routing,
     present_context_order,
 )
 
@@ -273,10 +274,48 @@ def _answer_scores(answer: str, sample: Any) -> Dict[str, float]:
     return out
 
 
+def _reference_scores(answer: str, sample: Any) -> Dict[str, float]:
+    """Exact match, token F1 and :func:`_answer_scores` for one answer.
+
+    Scored without citation markers, as ALCE does.
+    """
+    from .answer_metrics import exact_match, strip_citations, token_f1
+
+    answer = strip_citations(answer)
+    gt = getattr(sample, "ground_truth", "") or ""
+    aliases = getattr(sample, "ground_truth_answers", None) or []
+    if _is_unanswerable(sample):
+        em = f1 = _no_answer_em(answer)
+    elif gt.strip() and answer.strip():
+        em = exact_match(answer, gt, aliases=aliases)
+        f1 = token_f1(answer, gt, aliases=aliases)
+    else:
+        em = f1 = 0.0
+    return {"exact_match": em, "token_f1": f1, **_answer_scores(answer, sample)}
+
+
+#: The answer metrics an agentic arm gets on both answers: its loop's own
+#: (``_agentic``) and the harness's, written from the loop's passages
+#: (``_regen``). The unsuffixed key is the loop's where it answered, as for the
+#: judged metrics. Citation quality is left out: ``[n]`` numbers the passages
+#: the harness's generator was shown.
+_SCORED_ON_EITHER_ANSWER = (
+    "exact_match",
+    "token_f1",
+    "rouge_l",
+    "contains_answer",
+    "abstention_rate",
+    "answer_similarity",
+)
+
+
 def _add_answer_similarity(
-    rows: List[Dict[str, Any]], answers: List[str], samples: List[Any]
+    rows: List[Dict[str, Any]],
+    answers: List[str],
+    samples: List[Any],
+    key: str = "answer_similarity",
 ) -> None:
-    """``answer_similarity`` on each row that has a reference, in one batch.
+    """``answer_similarity`` (or ``key``) on each row that has a reference, in one batch.
 
     Left out, with a warning, when the embedder cannot be loaded (offline with
     no cached copy) or ``RAG_EVAL_SIMILARITY_MODEL=none``: the rest of the
@@ -306,7 +345,7 @@ def _add_answer_similarity(
         return
     for row, score in zip(rows, scores):
         if score is not None:
-            row["answer_similarity"] = score
+            row[key] = score
 
 
 def _add_citation_scores(
@@ -345,7 +384,40 @@ def _add_citation_scores(
         logger.warning(
             f"citation metrics: the judge scored {scored} of {len(cited)} citing answers"
         )
-    return None if scored else "judge produced no usable scores for citation_recall"
+    if scored:
+        return None
+    from .ragas_evaluator import cut_off_note
+
+    return _no_usable_scores(["citation_recall"], cut_off_note(judge))
+
+
+def _no_usable_scores(metrics: List[str], cut_off_note: str = "") -> str:
+    """The task's error when the judge scored none of ``metrics``, with why when known."""
+    message = "judge produced no usable scores for " + ", ".join(metrics)
+    return f"{message}: {cut_off_note}" if cut_off_note else message
+
+
+def _generation_failure(failed: int, total: int, cut_off: int, detail: str = "") -> str:
+    """The task's error when too many answers came back empty, with the cut-offs among them.
+
+    ``cut_off`` counts the replies that came back empty at their output-token
+    limit while the answers were made (#114): a reasoning model can spend the
+    limit before it answers, and the error then says so instead of only "could
+    not be generated". The generator's and the loops' limit is ``llm_max_tokens``.
+    """
+    message = f"{failed} of {total} answers could not be generated"
+    if detail:
+        message += f" ({detail})"
+    if cut_off:
+        from lasagna.providers.llm_provider import default_max_tokens
+
+        replies = "reply" if cut_off == 1 else "replies"
+        message += (
+            f"; {cut_off} LLM {replies} came back empty at their output-token limit, which "
+            f"a reasoning model can spend before it answers (the generator's and the "
+            f"loops' limit is {default_max_tokens()}: raise RAG_LLM_MAX_TOKENS)"
+        )
+    return message
 
 
 def _per_query_costs(rows: List[Dict[str, Any]]) -> Dict[str, float]:
@@ -939,6 +1011,73 @@ def _present_document_ids(
         )
 
 
+def _stored_enrichment(
+    backend: Any, collection_name: str, session_id: str, document_ids: Any
+) -> Optional[Dict[str, int]]:
+    """What contextual enrichment did to a stored corpus, from its chunks (#49).
+
+    Benchmark ingest marks each chunk it enriched with ``contextual_enriched``
+    in its metadata, False when the chunk was stored without its context.
+    Returns ``chunks`` marked and ``failed``, or None when no chunk is marked:
+    a corpus ingested before the mark existed, when the enrichment call failed
+    on every provider but OpenAI. Asked in the same bounded batches as
+    `_present_document_ids`.
+    """
+    from lasagna.vector_backends.filters import FilterExpression as _FE
+
+    ids = sorted(document_ids)
+    marked = without_context = 0
+    pending = [ids[i : i + 400] for i in range(0, len(ids), 400)]
+    with _fresh_reads(backend):
+        while pending:
+            batch = pending.pop()
+            rows = backend.query(
+                collection_name=collection_name,
+                filter_expr=_FE.and_(
+                    _FE.eq("session_id", session_id), _FE.in_list("document_id", batch)
+                ),
+                output_fields=["metadata"],
+                limit=_PRESENCE_QUERY_ROWS,
+            )
+            if len(rows) >= _PRESENCE_QUERY_ROWS and len(batch) > 1:
+                half = len(batch) // 2
+                pending.extend([batch[:half], batch[half:]])
+                continue
+            for row in rows:
+                metadata = row.get("metadata") or {}
+                if isinstance(metadata, str):
+                    metadata = json.loads(metadata)
+                if "contextual_enriched" not in metadata:
+                    # Weaviate stores metadata keys as the row's own properties.
+                    metadata = row
+                if "contextual_enriched" in metadata:
+                    marked += 1
+                    without_context += not metadata["contextual_enriched"]
+    if not marked:
+        return None
+    return {"chunks": marked, "failed": without_context}
+
+
+def _delete_stored_corpus(
+    store: Any, ingest_backend: Any, collection_name: str, session_id: str
+) -> None:
+    """Delete a corpus's vectors, keyword index and graph, so it is ingested again."""
+    try:
+        store.delete(
+            collection_name=collection_name,
+            filter_expr=store.session_filter(collection_name, session_id),
+        )
+    except Exception as exc:
+        # Ingesting again on top of vectors that could not be deleted
+        # duplicates chunks and changes rankings.
+        raise _StaleCorpusCleanupError(
+            f"Could not delete the vectors of session {session_id}: {exc}. Delete that "
+            f"session or collection and rerun."
+        ) from exc
+    ingest_backend.hybrid_searcher.clear_session(session_id)
+    _drop_corpus_graph(session_id, collection_name)
+
+
 #: Seconds before a census count that failed is asked once more.
 _RECOUNT_PAUSE = 2.0
 
@@ -1225,6 +1364,12 @@ def _known_override_keys() -> set:
 _COMPONENT_SETTING_KEYS = frozenset({"ensemble_reranker_models", "ensemble_reranker_weights"})
 
 
+#: Settings every arm shares, read from the environment by the process, not
+#: from an arm's overrides; an arm setting one would run the control's value
+#: under its own name.
+_PROCESS_SETTINGS = {"llm_max_tokens": "RAG_LLM_MAX_TOKENS"}
+
+
 def _check_override_keys(pipeline_configs: List[Dict[str, Any]]) -> None:
     """Refuse an arm setting a key nothing reads, before any corpus is ingested.
 
@@ -1234,6 +1379,13 @@ def _check_override_keys(pipeline_configs: List[Dict[str, Any]]) -> None:
     """
     known = _known_override_keys()
     for pc in pipeline_configs:
+        shared = sorted(set(pc.get("overrides") or {}) & set(_PROCESS_SETTINGS))
+        if shared:
+            names = ", ".join(_PROCESS_SETTINGS[k] for k in shared)
+            raise ValueError(
+                f"Arm {pc.get('name')!r} sets {', '.join(shared)}, which every arm shares: "
+                f"set {names} in the environment instead."
+            )
         unknown = sorted(set(pc.get("overrides") or {}) - known)
         if not unknown:
             continue
@@ -1427,6 +1579,41 @@ def _fix_retrieval_routing(task_config: Dict[str, Any]) -> None:
     task_config["use_agentic_rag"] = False
     task_config["agentic_pipeline"] = "legacy_react"
     task_config["routing_default_tier"] = "standard"
+
+
+_FAST_TIER_DISABLED_FEATURES = (
+    "enable_hyde",
+    "enable_reranking",
+    "enable_hybrid_search",
+    "enable_mmr",
+    "enable_context_reordering",
+    "enable_hierarchical",
+)
+
+
+def _fix_generation_routing(
+    gen_config: Dict[str, Any], overrides: Optional[Dict[str, Any]] = None
+) -> None:
+    """Upgrade speed's fast tier to standard only when an arm enables a fast-disabled stage.
+
+    The ``speed`` profile sets ``enable_query_routing=False`` and
+    ``routing_default_tier="fast"``, which triggers ``_FAST_OVERRIDES`` in
+    ``QueryRouter`` and silently disables HyDE, reranking, hybrid search, MMR,
+    context reordering, and hierarchical retrieval. A plain ``speed`` arm
+    keeps ``"fast"`` so its existing routing and metrics are preserved; an arm
+    that explicitly enables one of those six features (without explicitly
+    setting ``enable_query_routing`` or ``routing_default_tier``) is promoted
+    to ``"standard"`` so the enabled stage executes.
+    """
+    arm_overrides = overrides or {}
+    if "routing_default_tier" in arm_overrides or "enable_query_routing" in arm_overrides:
+        return
+    if (
+        not gen_config.get("enable_query_routing", True)
+        and str(gen_config.get("routing_default_tier", "standard")).lower() == "fast"
+        and any(gen_config.get(key) for key in _FAST_TIER_DISABLED_FEATURES)
+    ):
+        gen_config["routing_default_tier"] = "standard"
 
 
 def _context_order(gen_config: Any) -> Dict[str, str]:
@@ -2061,6 +2248,44 @@ class Experiment:
     ) -> None:
         self.config = config
         self._eval_fn = eval_fn
+        # What the judge was last validated under (see preflight_judge); None
+        # when no validation is pending for run() to skip.
+        self._judge_checked: Optional[tuple] = None
+
+    def preflight_judge(self) -> None:
+        """Validate the judge now, so the caller can fail before any work starts.
+
+        The CLI calls this beside its generator check. ``run()`` then skips its
+        own check once, rather than probing the judge a second time. The record
+        is consumed by that run, and is ignored if the judge's model, endpoint
+        or key changed since, so it cannot excuse a later run or another
+        configuration. A no-op where no judge is needed (retrieval-only runs,
+        a custom ``eval_fn``).
+
+        Raises:
+            RuntimeError: the judge cannot be built or reached; the message
+                names the model and the variables to set.
+        """
+        if self._eval_fn is not None:
+            return
+        if "generation" not in _parse_tracks(self.config.tracks) and any(
+            getattr(b, "path", "") for b in self.config.benchmarks
+        ):
+            # Local data files are only registered during generate_tasks();
+            # register them here so resolve_mode() sees their corpus instead of
+            # falling back to generation_only for an unknown benchmark name.
+            from .benchmarks.adapters.local_files import prepare_local_benchmarks
+
+            prepare_local_benchmarks(
+                self.config.benchmarks, self.config.base_dir, self.config.tracks
+            )
+        if not _should_check_judge(self.config, self._eval_fn):
+            return
+        fingerprint = _judge_fingerprint(_resolve_judge_model(self.config))
+        if self._judge_checked == fingerprint:
+            return
+        _check_judge_llm(fingerprint[0])
+        self._judge_checked = fingerprint
 
     @classmethod
     def from_file(cls, path: str, eval_fn: Optional[Callable] = None) -> "Experiment":
@@ -2165,9 +2390,12 @@ class Experiment:
         Returns:
             :class:`BenchmarkResults` with all task outcomes.
         """
+        global _active_judge_model
         try:
             return await self._run(progress_callback)
         finally:
+            _active_judge_model = None
+            self._judge_checked = None  # a preflight covers one run
             _tidy_run_folder(self.config)
 
     async def _run(
@@ -2213,6 +2441,13 @@ class Experiment:
         problem = _offline_dataset_problem([t.benchmark_name for t in tasks])
         if problem is not None:
             raise problem
+
+        # Validate the judge once per run before any corpus is ingested or any
+        # answer is generated (#96).
+        if _should_check_judge(cfg, self._eval_fn) and self._judge_checked != _judge_fingerprint(
+            _active_judge_model
+        ):
+            await asyncio.to_thread(_check_judge_llm, _active_judge_model)
 
         # Pre-register corpus ref counts for live mode.
         # With max_concurrency=1 tasks run sequentially; without this,
@@ -2800,9 +3035,37 @@ def _sampling_record() -> Dict[str, Any]:
         "generator": {
             "model": generator,
             "sampling": sampling_label(generator, platform) if generator else None,
+            "max_tokens": _generator_limit_for_record(),
         },
-        "judge": {"model": judge, "sampling": sampling_label(judge, _judge_platform())},
+        "judge": {
+            "model": judge,
+            "sampling": sampling_label(judge, _judge_platform()),
+            "max_tokens": _judge_limit_for_record(),
+        },
     }
+
+
+def _generator_limit_for_record() -> Optional[int]:
+    """The generator's output-token limit (``llm_max_tokens``), for the run metadata.
+
+    None if the settings cannot be read; the run itself then stops on them.
+    """
+    from lasagna.providers.llm_provider import default_max_tokens
+
+    try:
+        return default_max_tokens()
+    except ValueError:
+        return None
+
+
+def _judge_limit_for_record() -> Optional[int]:
+    """The judge's output-token limit, for the run metadata; None if the setting is unreadable."""
+    from .ragas_evaluator import RAGAS_JUDGE_MAX_TOKENS, judge_max_tokens
+
+    try:
+        return judge_max_tokens() or RAGAS_JUDGE_MAX_TOKENS
+    except ValueError:
+        return None
 
 
 def _sampling_notes() -> List[str]:
@@ -2847,7 +3110,7 @@ def _resolve_generator_model() -> Optional[str]:
     return os.environ.get("RAG_EVAL_GENERATOR_MODEL") or os.environ.get("MODEL_NAME") or None
 
 
-def _build_judge_llm(model_name: Optional[str] = None):
+def _build_judge_llm(model_name: Optional[str] = None, *, _require: bool = False):
     """Build the RAGAS judge LLM against an OpenAI-compatible endpoint.
 
     Credentials resolve judge-first so they cannot disturb the generator's
@@ -2860,9 +3123,8 @@ def _build_judge_llm(model_name: Optional[str] = None):
                 → ``DEFAULT_JUDGE_MODEL``
     ==========  ==========================================================
 
-    Returns None when construction fails, or when nothing names a judge and
-    there is no key for the default one; callers then fall back to the RAGAS
-    default judge.
+    Returns None when construction fails (unless ``_require=True``), or when
+    nothing names a judge and there is no key for the default one.
 
     Each request is rebuilt for the model it names (``pin_openai_client``):
     RAGAS sends gpt-5 and later temperature 1.0 at their default reasoning
@@ -2880,7 +3142,7 @@ def _build_judge_llm(model_name: Optional[str] = None):
     if not resolved_model:
         resolved_model = DEFAULT_JUDGE_MODEL
     named = model_name or os.environ.get("RAG_EVAL_JUDGE_MODEL")
-    if resolved_model == DEFAULT_JUDGE_MODEL and not named and not api_key:
+    if not _require and resolved_model == DEFAULT_JUDGE_MODEL and not named and not api_key:
         # The default judge needs a key, and nobody asked for it: no judge is
         # not an error here, as it was not before there was a default.
         return None
@@ -2904,16 +3166,150 @@ def _build_judge_llm(model_name: Optional[str] = None):
         from lasagna.utils.llm_cache import cache_openai_client
         from lasagna.utils.token_usage import EVAL, instrument_openai_client
 
+        from .ragas_evaluator import (
+            CUT_OFF_ATTR,
+            RAGAS_JUDGE_MAX_TOKENS,
+            count_cut_off_replies,
+            judge_extra_body,
+            judge_max_tokens,
+        )
+
+        # Unset, RAGAS's own limit applies and the request is the one RAGAS
+        # sends. A reasoning judge needs more, as its reasoning counts against
+        # it, or its reasoning turned off through the extra body.
+        max_tokens = judge_max_tokens()
+        extra_body = judge_extra_body()
+        settings: Dict[str, Any] = {}
+        if max_tokens:
+            settings["max_tokens"] = max_tokens
+        if extra_body:
+            settings["extra_body"] = extra_body
         client = instrument_openai_client(cache_openai_client(OpenAI(**client_kwargs)), EVAL)
-        judge = llm_factory(resolved_model, client=pin_openai_client(client, _JUDGE_TEMPERATURE))
+        cut_off = count_cut_off_replies(client, max_tokens or RAGAS_JUDGE_MAX_TOKENS)
+        judge = llm_factory(
+            resolved_model, client=pin_openai_client(client, _JUDGE_TEMPERATURE), **settings
+        )
+        # Counting must never break the judge: an object that takes no new
+        # attribute is a judge whose cut-offs go uncounted.
+        with contextlib.suppress(Exception):
+            setattr(judge, CUT_OFF_ATTR, cut_off)
         logger.info(f"RAGAS judge using model: {resolved_model}")
         return judge
     except Exception as exc:
+        if _require:
+            raise
         logger.warning(
             f"Could not create judge LLM ({resolved_model}) [{type(exc).__name__}]: {exc}"
         )
-        logger.exception("Judge LLM construction failed; RAGAS will use its default")
+        logger.exception("Judge LLM construction failed; judge metrics will fail")
         return None
+
+
+def _redact_secret(text: str, secret: Optional[str]) -> str:
+    """Strip a credential value if an upstream exception ever echoed it."""
+    if secret and len(secret) >= 4 and secret in text:
+        return text.replace(secret, "<redacted>")
+    return text
+
+
+def _judge_error_message(
+    resolved_model: str,
+    base_url: Optional[str],
+    detail: str,
+) -> str:
+    endpoint = f" at {base_url}" if base_url else ""
+    return (
+        f"Judge LLM ({resolved_model}{endpoint}) could not be reached or configured: "
+        f"{detail}. The RAGAS judge uses its own OpenAI-compatible client and does not "
+        f"inherit OLLAMA_BASE_URL or the generator's LLM provider. Set "
+        f"RAG_EVAL_JUDGE_BASE_URL and RAG_EVAL_JUDGE_API_KEY (falling back to "
+        f"OPENAI_BASE_URL and OPENAI_API_KEY; set OPENAI_API_KEY for the default judge "
+        f"{DEFAULT_JUDGE_MODEL}), and RAG_EVAL_JUDGE_MODEL to choose the judge model."
+    )
+
+
+def _should_check_judge(cfg: "ExperimentConfig", eval_fn: Optional[Callable]) -> bool:
+    """Whether ``Experiment._run`` should validate the judge before tasks start."""
+    if eval_fn is not None or not _writes_answers(cfg):
+        return False
+    if (
+        "retrieval" in _parse_tracks(cfg.tracks)
+        and not any(resolve_mode(cfg.mode, s.name)[0] == "generation_only" for s in cfg.benchmarks)
+        and not os.environ.get("RAG_EVAL_JUDGE_MODEL")
+        and not cfg.judge_model
+    ):
+        from .synthesize import llm_configured
+
+        if not llm_configured():
+            # Both tracks with no LLM configured at all: _eval_live skips
+            # generation and keeps retrieval metrics (test_generation_without_a_key).
+            return False
+    return True
+
+
+def _judge_fingerprint(model_name: Optional[str]) -> tuple:
+    """The model, key and endpoint a judge check applies to (never logged)."""
+    return (
+        model_name or os.environ.get("RAG_EVAL_JUDGE_MODEL") or DEFAULT_JUDGE_MODEL,
+        os.environ.get("RAG_EVAL_JUDGE_API_KEY") or os.environ.get("OPENAI_API_KEY"),
+        os.environ.get("RAG_EVAL_JUDGE_BASE_URL") or os.environ.get("OPENAI_BASE_URL"),
+    )
+
+
+def _check_judge_llm(model_name: Optional[str] = None) -> None:
+    """Build the RAGAS judge and run one minimal structured-output request.
+
+    Called once at the start of an experiment that writes answers, outside the
+    LLM cache and per-task token meters, so a missing key, wrong base URL, or
+    unreachable model stops the run before any corpus is ingested or any answer
+    is generated.
+    """
+    resolved_model = (
+        model_name
+        or _active_judge_model
+        or os.environ.get("RAG_EVAL_JUDGE_MODEL")
+        or DEFAULT_JUDGE_MODEL
+    )
+    api_key = os.environ.get("RAG_EVAL_JUDGE_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    base_url = os.environ.get("RAG_EVAL_JUDGE_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
+
+    from pydantic import BaseModel
+
+    class _JudgeProbe(BaseModel):
+        ok: bool
+
+    judge = None
+    try:
+        judge = _build_judge_llm(resolved_model, _require=True)
+        if judge is None:
+            raise RuntimeError(
+                "Judge LLM construction returned None (no API key or client configured)"
+            )
+        judge.generate('Reply with {"ok": true}.', _JudgeProbe)
+    except Exception as exc:
+        from .ragas_evaluator import cut_off_note
+
+        # It answered: a reasoning judge spent the limit thinking. Not a
+        # credentials problem, so not the advice below.
+        note = cut_off_note(judge)
+        if note:
+            raise RuntimeError(f"Judge LLM ({resolved_model}) answered, but {note}.") from None
+        root = exc.__cause__ if exc.__cause__ is not None else exc
+        if type(root).__name__ in ("ValidationError", "JSONDecodeError"):
+            # It answered, with JSON that does not fit (Qwen3 reasoning on
+            # vLLM sometimes sends `{}`): not a credentials problem either.
+            detail = _redact_secret(str(root), api_key)
+            raise RuntimeError(
+                f"Judge LLM ({resolved_model}) answered, but not with the JSON it was asked "
+                f"for: {detail}. A reasoning model can answer that way: turn its reasoning "
+                f"off for the judge with RAG_EVAL_JUDGE_EXTRA_BODY (docs/configuration.md)."
+            ) from None
+        exc_names = (
+            f"{type(exc).__name__}/{type(root).__name__}" if root is not exc else type(exc).__name__
+        )
+        msg = str(root) if root is not exc and str(root) else str(exc)
+        detail = _redact_secret(f"[{exc_names}] {msg}", api_key)
+        raise RuntimeError(_judge_error_message(resolved_model, base_url, detail)) from None
 
 
 async def _default_eval_fn(
@@ -3335,6 +3731,10 @@ async def _eval_offline(
                             prompt,
                         )
                     answer = response.content if hasattr(response, "content") else str(response)
+                if not (answer or "").strip():
+                    # Nothing came back (a reasoning model can spend its whole
+                    # limit reasoning): a failed answer, as on the live path.
+                    _offline_failed_generations += 1
                 per_sample_latencies.append((time.monotonic() - q_start) * 1000)
             except Exception as exc:
                 # The gold context used to stand in as the answer here, which a
@@ -3376,15 +3776,23 @@ async def _eval_offline(
         # The judge's own spend, kept separate from the system's. It is often
         # the larger of the two, and reporting one total lets an expensive
         # judge masquerade as an expensive pipeline.
-        if _ans_idx:
+        #
+        # In a thread, as on the live path: RAGAS's evaluate is synchronous,
+        # and on this loop it would apply nest_asyncio and run its jobs here,
+        # which can pop from an empty ready queue and stop the whole run
+        # (#117). The meter is entered in the thread, where the calls happen.
+        def _judge_in_thread():
             with eval_meter, eval_meter.scope(EVAL):
-                detailed = evaluator.evaluate_detailed(
+                return evaluator.evaluate_detailed(
                     questions=[questions[i] for i in _ans_idx],
                     answers=[answers[i] for i in _ans_idx],
                     contexts=[contexts[i] for i in _ans_idx],
                     ground_truths=[ground_truths[i] for i in _ans_idx],
                     metrics=eval_metrics,
                 )
+
+        if _ans_idx:
+            detailed = await asyncio.to_thread(_judge_in_thread)
             metrics = dict(detailed.aggregate)
         # One row per sample, in sample order; the judge's rows go to the
         # answerable samples they scored.
@@ -3402,8 +3810,6 @@ async def _eval_offline(
                 per_sample_scores[i].update(per_sample_usage[i].to_dict())
 
         # EM/F1 + trajectory for offline path (mirrors live path)
-        from .answer_metrics import exact_match as _em_fn, strip_citations, token_f1 as _tf1_fn
-
         _save_traj = (task.config_overrides or {}).get("save_trajectories", "minimal")
         for i, sample in enumerate(eval_samples):
             if i >= len(per_sample_scores):
@@ -3415,20 +3821,9 @@ async def _eval_offline(
             _meta = getattr(sample, "metadata", {}) or {}
             ps["_source_benchmark"] = _meta.get("source_benchmark", "")
 
-            # EM/F1, on the answer without citation markers
             _gt = ground_truths[i] if i < len(ground_truths) else ""
             _ans = answers[i] if i < len(answers) else ""
-            _scored = strip_citations(_ans)
-            _aliases = getattr(sample, "ground_truth_answers", None) or []
-            if _is_unanswerable(sample):
-                ps["exact_match"] = ps["token_f1"] = _no_answer_em(_scored)
-            elif _gt.strip() and _scored.strip():
-                ps["exact_match"] = _em_fn(_scored, _gt, aliases=_aliases)
-                ps["token_f1"] = _tf1_fn(_scored, _gt, aliases=_aliases)
-            else:
-                ps["exact_match"] = 0.0
-                ps["token_f1"] = 0.0
-            ps.update(_answer_scores(_scored, sample))
+            ps.update(_reference_scores(_ans, sample))
             if _has_unanswerable:
                 ps["_answerable"] = 0.0 if _is_unanswerable(sample) else 1.0
 
@@ -3446,6 +3841,8 @@ async def _eval_offline(
 
         # Semantic similarity (local embedder) and, for answers that cite,
         # citation quality (the judge, counted as eval spend).
+        from .answer_metrics import strip_citations
+
         await asyncio.to_thread(
             _add_answer_similarity,
             per_sample_scores,
@@ -3507,7 +3904,7 @@ async def _eval_offline(
     _offline_failures: List[str] = []
     if getattr(detailed, "failed_metrics", None):
         _offline_failures.append(
-            "judge produced no usable scores for " + ", ".join(detailed.failed_metrics)
+            _no_usable_scores(detailed.failed_metrics, getattr(detailed, "cut_off_note", ""))
         )
     if _citation_failure:
         _offline_failures.append(_citation_failure)
@@ -3515,8 +3912,12 @@ async def _eval_offline(
         result.metrics["generations_failed"] = float(_offline_failed_generations)
         if _offline_failed_generations / len(eval_samples) > _MAX_FAILED_GENERATION_RATE:
             _offline_failures.append(
-                f"{_offline_failed_generations} of {len(eval_samples)} answers could not be "
-                f"generated (failed, or no generator configured)"
+                _generation_failure(
+                    _offline_failed_generations,
+                    len(eval_samples),
+                    sum(u.cut_off for u in per_sample_usage),
+                    "failed, or no generator configured",
+                )
             )
     result.error = "; ".join(_offline_failures) or None
     result.compute_latency_stats()
@@ -4067,6 +4468,8 @@ async def _ensure_corpus_ingested(
         expected_valid_ids = {corpus_to_valid[cid] for cid in corpus}
         ready_ids: set = set()
         _skip_ingest = False
+        #: What enrichment did to a contextual corpus this run reuses (#49).
+        _reused_enrichment: Optional[Dict[str, int]] = None
         # Documents that could not be ingested, in this run or (allowlisted)
         # in the run that built the corpus being reused.
         failed_valid_ids: set = set()
@@ -4128,6 +4531,42 @@ async def _ensure_corpus_ingested(
                     _ingest_backend.hybrid_searcher.clear_session(shared_session_id)
                     _drop_corpus_graph(shared_session_id, _coll_name)
                     ready_ids = set()
+
+            # A reused contextual corpus reports what enrichment did to it, from
+            # the mark on each chunk. Reused with chunks stored without their
+            # context, a run recorded nothing and the arm scored plain chunks
+            # as contextual (#49). It is not deleted for that: another run may
+            # be searching it. Only a corpus with no marks, ingested before
+            # they existed, is ingested again.
+            if _skip_ingest and getattr(
+                _rag_cfg.with_session(shared_session_id), "enable_contextual_retrieval", False
+            ):
+                try:
+                    _reused_enrichment = _stored_enrichment(
+                        _resolved, _coll_name, shared_session_id, ready_ids
+                    )
+                    _why = "its chunks carry no record of enrichment (ingested before #49)"
+                except Exception as _check_exc:
+                    # Caught here: the handler below deletes the vectors but
+                    # would leave this run skipping the ingest.
+                    _why = f"its enrichment could not be checked ({_check_exc})"
+                if _reused_enrichment is None:
+                    logger.warning(
+                        f"Not reusing contextual corpus {shared_session_id}: {_why}. "
+                        f"Deleting it and ingesting it again."
+                    )
+                    # First: if the delete raises, the handler below still
+                    # leaves this run to ingest.
+                    _skip_ingest = False
+                    ready_ids = set()
+                    failed_valid_ids = set()
+                    _delete_stored_corpus(_resolved, _ingest_backend, _coll_name, shared_session_id)
+                elif _reused_enrichment["failed"]:
+                    logger.warning(
+                        f"Reusing contextual corpus {shared_session_id}: "
+                        f"{_reused_enrichment['failed']} of its {_reused_enrichment['chunks']} "
+                        f"chunks were stored without context, and this run records it."
+                    )
         except _StaleCorpusCleanupError:
             raise
         except Exception as exc:
@@ -4152,8 +4591,15 @@ async def _ensure_corpus_ingested(
             _drop_corpus_graph(shared_session_id, _coll_name)
             ready_ids = set()
 
+        contextual_info = None
+        if _skip_ingest and _reused_enrichment is not None:
+            contextual_info = {
+                **_reused_enrichment,
+                "error": "corpus reused; the run that ingested it logged why",
+            }
         if not _skip_ingest:
             _session_cfg = _rag_cfg.with_session(shared_session_id)
+            _enrichment: Dict[str, Any] = {}
             total_chunks, ingested_ids, error_ids = await _fast_ingest(
                 corpus=corpus,
                 corpus_to_valid=corpus_to_valid,
@@ -4163,7 +4609,17 @@ async def _ensure_corpus_ingested(
                 backend=_ingest_backend,
                 chunker=(components or {}).get("chunker"),
                 embedder=(components or {}).get("embedder"),
+                enrichment=_enrichment,
             )
+            if getattr(_session_cfg, "enable_contextual_retrieval", False):
+                from lasagna.core.provenance import redact
+
+                # What enrichment did to the chunks this run stored (#49).
+                contextual_info = {
+                    "chunks": _enrichment.get("chunks", 0),
+                    "failed": _enrichment.get("failed", 0),
+                    "error": str(redact(_enrichment.get("error", "")))[:200],
+                }
             logger.info(
                 f"Fast ingestion complete: {total_chunks} chunks from "
                 f"{len(ingested_ids)} docs, {len(error_ids)} errors"
@@ -4248,6 +4704,7 @@ async def _ensure_corpus_ingested(
             slot["corpus_truncated"] = bool(getattr(adapter, "corpus_truncated", False))
             slot["corpus_ingest_gap"] = ingest_gap
             slot["graph"] = graph_info
+            slot["contextual"] = contextual_info
             slot["corpus_census"] = census
             slot["_census_store"] = (
                 lambda: _get_ingest_backend()._collection_manager.resolve_backend(shared_session_id)
@@ -4297,6 +4754,28 @@ async def _release_corpus(benchmark_name: str, corpus_key: Optional[str] = None)
         logger.debug(
             f"Released in-memory corpus entry '{cache_key}' (Milvus data retained for reuse)"
         )
+
+
+def _record_corpus_fallback(system: Dict[str, Any], stage: str, why: str, tallies) -> None:
+    """Name ``stage`` as fallen back for every query of each track that ran.
+
+    For what went wrong once for the whole corpus, at ingest: every query of the
+    arm ran on it. Reported as the bundle reports a stage that fell back during
+    a query (#84), ahead of any reason recorded then. ``tallies`` are
+    ``(track, tally)`` pairs.
+    """
+    for track, tally in tallies:
+        if not tally.queries:
+            continue
+        stages = system.setdefault("degraded_stages", {}).setdefault(track, {})
+        before = stages.get(stage) or {}
+        stages[stage] = {
+            **before,
+            "queries": tally.queries,
+            "of": tally.queries,
+            "reasons": [{"reason": why, "queries": tally.queries}]
+            + list(before.get("reasons") or []),
+        }
 
 
 async def _eval_live(
@@ -4633,7 +5112,12 @@ async def _eval_live(
 
     # Save config for generation path — includes task overrides + embedding fixes,
     # but NOT the IR-specific overrides that disable agentic routing.
+    # Keep `gen_config` as the arm's configured values for `system["stages"]`
+    # and derive `gen_exec_config` for runtime search so promoting an arm that
+    # enables a fast-disabled stage to `standard` does not alter stage digests.
     gen_config = dict(pipeline._config)
+    gen_exec_config = dict(gen_config)
+    _fix_generation_routing(gen_exec_config, task.config_overrides)
 
     # Live-mode fix 2 (IR only): Disable agentic/comprehensive routing.
     # The agentic pipeline runs multi-hop retrieval + LLM synthesis. For IR
@@ -4677,6 +5161,7 @@ async def _eval_live(
     _eval_failures: List[str] = []
     _n_generations = 0
     _failed_generations = 0
+    _failed_regen = 0  # the harness's answer alone, for an agentic arm's _regen keys
     total_dropped = 0
     #: The judge's spend, accumulated across every RAGAS pass in this task.
     eval_meter = UsageMeter()
@@ -4685,6 +5170,9 @@ async def _eval_live(
     # What fell back while each track's queries ran (#50).
     _ir_degraded = _DegradedTally()
     _gen_degraded = _DegradedTally()
+    # Effective runtime routing tiers executed per track (#98).
+    _ir_routing_tiers: Dict[str, int] = {}
+    _gen_routing_tiers: Dict[str, int] = {}
 
     # The cutoff the IR metrics are reported at. Was hard-coded to 10 in six
     # places, so NDCG@100 and Recall@1000 -- the cutoffs much of the retrieval
@@ -4763,6 +5251,7 @@ async def _eval_live(
                 sample_meter,
                 sample_meter.scope(SYSTEM),
                 observe_reranking() as moved,
+                observe_routing() as _ir_tiers,
                 _ir_degraded.query(),
             ):
                 search_results = await asyncio.to_thread(
@@ -4772,6 +5261,8 @@ async def _eval_live(
                     shared_session_id,
                     task_config,
                 )
+            for _tier in _ir_tiers:
+                _ir_routing_tiers[_tier] = _ir_routing_tiers.get(_tier, 0) + 1
             query_latency_ms = (time.monotonic() - query_start) * 1000
 
             # Extract doc IDs from search results.
@@ -5007,6 +5498,7 @@ async def _eval_live(
                             gen_meter,
                             gen_meter.scope(SYSTEM),
                             present_context_order() as _presented,
+                            observe_routing() as _gen_tiers,
                             _gen_degraded.query(),
                         ):
                             search_results = await asyncio.wait_for(
@@ -5015,10 +5507,12 @@ async def _eval_live(
                                     gen_sample.question,
                                     10,
                                     shared_session_id,
-                                    gen_config,
+                                    gen_exec_config,
                                 ),
                                 timeout=300,  # 5 min
                             )
+                        for _tier in _gen_tiers:
+                            _gen_routing_tiers[_tier] = _gen_routing_tiers.get(_tier, 0) + 1
                     except asyncio.TimeoutError:
                         logger.warning(
                             f"Query timed out after 5 min for sample "
@@ -5054,7 +5548,9 @@ async def _eval_live(
                     first_meta = (
                         getattr(getattr(search_results[0], "chunk", None), "metadata", {}) or {}
                     )
-                    _agentic_answer = first_meta.get("_agentic_answer", "")
+                    _agentic_answer = first_meta.get("_agentic_answer", "") or ""
+                    if not _agentic_answer.strip():
+                        _agentic_answer = ""  # blank: the loop did not answer
 
                 # Agentic pipeline makes many parallel LLM calls which can
                 # saturate a hosted endpoint's rate limit. An optional pause
@@ -5196,9 +5692,12 @@ async def _eval_live(
 
                 _n_generations += 1
                 if not (answer or "").strip():
-                    # No answer: no context, no generator, or every attempt
-                    # failed. Scored, it would read as an unfaithful answer.
-                    _failed_generations += 1
+                    _failed_regen += 1
+                    if not _agentic_answer:
+                        # No answer: no context, no generator, or every attempt
+                        # failed. Scored, it would read as an unfaithful answer.
+                        # A loop's own answer is the one its row is scored on.
+                        _failed_generations += 1
                 gen_questions.append(gen_sample.question)
                 gen_answers.append(answer)
                 # Pass the SAME contexts used for generation to RAGAS.
@@ -5218,23 +5717,8 @@ async def _eval_live(
                     if hasattr(gen_sample, "metadata")
                     else ""
                 )
-                # ── EM / Token-F1 (free, no LLM calls) ──────────────
-                # Scored on the answer without citation markers, as ALCE does.
-                from .answer_metrics import strip_citations
-
-                _scored_answer = strip_citations(answer)
-                _em_score = 0.0
-                _f1_score_val = 0.0
+                # ── EM / Token-F1 and the other free answer metrics ──
                 _gt = gen_sample.ground_truth or ""
-                _gt_aliases = getattr(gen_sample, "ground_truth_answers", None) or []
-                if _is_unanswerable(gen_sample):
-                    _em_score = _f1_score_val = _no_answer_em(_scored_answer)
-                elif _gt.strip() and _scored_answer.strip():
-                    from .answer_metrics import exact_match as _em_fn, token_f1 as _tf1_fn
-
-                    _em_score = _em_fn(_scored_answer, _gt, aliases=_gt_aliases)
-                    _f1_score_val = _tf1_fn(_scored_answer, _gt, aliases=_gt_aliases)
-
                 _gen_sample_metrics: Dict[str, Any] = {
                     "_sample_id": gen_sample.query_id,
                     "_source_benchmark": _src,
@@ -5245,10 +5729,15 @@ async def _eval_live(
                     "generation_ms": _generation_ms,
                     "n_contexts": float(len(contexts)),
                     "agentic_fallback": 1.0 if fallback else 0.0,
-                    "exact_match": _em_score,
-                    "token_f1": _f1_score_val,
+                    **_reference_scores(answer, gen_sample),
                 }
-                _gen_sample_metrics.update(_answer_scores(_scored_answer, gen_sample))
+                if _agentic_answer:
+                    _gen_sample_metrics.update(
+                        {
+                            f"{k}_agentic": v
+                            for k, v in _reference_scores(_agentic_answer, gen_sample).items()
+                        }
+                    )
                 if _has_unanswerable:
                     _gen_sample_metrics["_answerable"] = (
                         0.0 if _is_unanswerable(gen_sample) else 1.0
@@ -5283,6 +5772,9 @@ async def _eval_live(
                 elif _save_traj == "minimal":
                     _gen_sample_metrics["_generated_answer"] = answer[:500]
                     _gen_sample_metrics["_question"] = gen_sample.question[:200]
+                if _agentic_answer and _save_traj in ("full", "minimal"):
+                    _cut = 2000 if _save_traj == "full" else 500
+                    _gen_sample_metrics["_agentic_answer"] = _agentic_answer[:_cut]
 
                 per_sample_scores.append(_gen_sample_metrics)
 
@@ -5297,6 +5789,25 @@ async def _eval_live(
                 [strip_citations(a) for a in gen_answers],
                 gen_samples,
             )
+
+            # An agentic arm is scored on its loop's answer, as the judged
+            # metrics below are: the harness's answer keeps the _regen keys,
+            # and a question the loop did not answer keeps the harness's.
+            _looped = filter_nonempty_agentic_indices(gen_agentic_answers)
+            if _looped:
+                await asyncio.to_thread(
+                    _add_answer_similarity,
+                    [_gen_rows[i] for i in _looped],
+                    [strip_citations(gen_agentic_answers[i]) for i in _looped],
+                    [gen_samples[i] for i in _looped],
+                    "answer_similarity_agentic",
+                )
+                for row in _gen_rows:
+                    for k in _SCORED_ON_EITHER_ANSWER:
+                        if k in row:
+                            row[f"{k}_regen"] = row[k]
+                        if f"{k}_agentic" in row:
+                            row[k] = row[f"{k}_agentic"]
 
             # Run RAGAS on all collected generation samples that have a
             # reference answer (an unanswerable question has none).
@@ -5344,8 +5855,10 @@ async def _eval_live(
                     )
                     if getattr(regen_result, "failed_metrics", None):
                         _eval_failures.append(
-                            "judge produced no usable scores for "
-                            + ", ".join(regen_result.failed_metrics)
+                            _no_usable_scores(
+                                regen_result.failed_metrics,
+                                getattr(regen_result, "cut_off_note", ""),
+                            )
                         )
                     # Store aggregate scores (prefix with _regen when agentic
                     # answers are also available, otherwise use plain names).
@@ -5498,6 +6011,16 @@ async def _eval_live(
                 metrics["token_f1"] = sum(s["token_f1"] for s in _gen_ps) / len(_gen_ps)
                 metrics.update(_answerability_split(_gen_ps))
                 metrics.update(_mean_present(_gen_ps, _ANSWER_METRICS))
+                metrics.update(
+                    _mean_present(
+                        _gen_ps,
+                        [
+                            f"{k}{s}"
+                            for s in ("_regen", "_agentic")
+                            for k in _SCORED_ON_EITHER_ANSWER
+                        ],
+                    )
+                )
 
         # Tokens and LLM calls per query, over both tracks' rows.
         metrics.update(_per_query_costs(per_sample_scores))
@@ -5520,11 +6043,16 @@ async def _eval_live(
 
     if _n_generations:
         metrics["generations_failed"] = float(_failed_generations)
+        if any(gen_agentic_answers):
+            # The _regen keys average these empty answers in as misses.
+            metrics["generations_failed_regen"] = float(_failed_regen)
         # A few failures (a content filter, one timeout) are reported; more than
         # a tenth means the generation metrics describe the outage, not the system.
         if _failed_generations / _n_generations > _MAX_FAILED_GENERATION_RATE:
             _eval_failures.append(
-                f"{_failed_generations} of {_n_generations} answers could not be generated"
+                _generation_failure(
+                    _failed_generations, _n_generations, gen_meter.usage(SYSTEM).cut_off
+                )
             )
 
     _system = _ran_system(
@@ -5597,6 +6125,13 @@ async def _eval_live(
         ]
     except Exception as exc:  # the manifest must never cost a result
         logger.warning(f"Could not record the stage manifest: {exc}")
+    _routing_tiers = {
+        track: dict(sorted(counts.items()))
+        for track, counts in (("retrieval", _ir_routing_tiers), ("generation", _gen_routing_tiers))
+        if counts
+    }
+    if _routing_tiers:
+        _system["routing_tiers"] = _routing_tiers
     if _context_free:
         # Read by the reports, which say why this arm has no faithfulness.
         _system["generator_context"] = "none"
@@ -5636,18 +6171,27 @@ async def _eval_live(
                 f"{_graph['unparsed_chunks']} replies of the extraction model held no readable JSON"
             )
         if _why:
-            for _track, _tally in (("retrieval", _ir_degraded), ("generation", _gen_degraded)):
-                if not _tally.queries:
-                    continue
-                _stages = _system.setdefault("degraded_stages", {}).setdefault(_track, {})
-                _before = _stages.get("graphrag") or {}
-                _stages["graphrag"] = {
-                    **_before,
-                    "queries": _tally.queries,
-                    "of": _tally.queries,
-                    "reasons": [{"reason": _why, "queries": _tally.queries}]
-                    + list(_before.get("reasons") or []),
-                }
+            _record_corpus_fallback(
+                _system,
+                "graphrag",
+                _why,
+                (("retrieval", _ir_degraded), ("generation", _gen_degraded)),
+            )
+    _contextual = corpus_info.get("contextual") or {}
+    if _contextual.get("failed"):
+        # Chunks this run stored without the context the arm is named for (#49).
+        _why = (
+            f"contextual enrichment failed for {_contextual['failed']} of "
+            f"{_contextual.get('chunks', 0)} chunks at ingest; they were stored without context"
+        )
+        if _contextual.get("error"):
+            _why += f" ({_contextual['error']})"
+        _record_corpus_fallback(
+            _system,
+            "contextual_retrieval",
+            _why,
+            (("retrieval", _ir_degraded), ("generation", _gen_degraded)),
+        )
 
     result = TaskResult(
         task_key=task.task_key,

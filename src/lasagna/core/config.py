@@ -166,6 +166,7 @@ _VALID_RANGES: Dict[str, Tuple[float, float]] = {
     "max_concurrent_uploads": (1, 20),
     "max_quality_check_attempts": (1, 20),
     "docling_max_tokens": (64, 32_768),
+    "llm_max_tokens": (1, 262_144),
 }
 
 #: Settings whose value is one of a fixed set (compared without case).
@@ -1167,6 +1168,10 @@ class RAGConfig:
             "query2doc_format": "dense",
             "query2doc_query_repeats": 5,
             "query2doc_max_tokens": 128,
+            # Output tokens a call to the default LLM may spend when its caller
+            # names no limit: the harness's generator and every loop. A
+            # reasoning model reasons inside it (#114).
+            "llm_max_tokens": 1000,
             "enable_crag": False,  # Corrective RAG: LLM grades retrieval quality
             "crag_web_search_fallback": False,  # Fall back to web search if retrieval quality is low
             # =================================================================
@@ -2373,6 +2378,13 @@ class RAGConfig:
         )
 
     @property
+    def llm_max_tokens(self) -> int:
+        """Output tokens of an LLM call whose caller names no limit (generator, loops, ingestion)."""
+        return self._get_knowledge_setting(
+            "rag", "llm_max_tokens", default=self._config["llm_max_tokens"]
+        )
+
+    @property
     def query2doc_max_tokens(self) -> int:
         """Query2doc: token budget for the generated pseudo-document."""
         return self._get_knowledge_setting(
@@ -3046,7 +3058,7 @@ class RAGConfig:
     @property
     def agent_temperature(self) -> float:
         """Temperature for agent/refinement model (low for determinism)."""
-        return self._get_knowledge_setting("rag", "agent_temperature", default=0.1)
+        return self._get_knowledge_setting("rag", "agent_temperature", default=0.0)
 
     @property
     def max_query_length(self) -> int:

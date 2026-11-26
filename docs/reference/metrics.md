@@ -2,7 +2,7 @@
 
 This page lists the metrics a run reports and what each one costs. The
 [full definitions](https://github.com/dolev31/lasagna/blob/main/src/lasagna/knowledge_evaluation_sdk/docs/metrics.md)
-give formulas and edge cases. The metrics version is 1.7. It is part of the
+give formulas and edge cases. The metrics version is 1.8. It is part of the
 [comparability key](../concepts/comparability.md), so numbers from a different
 version never share a leaderboard group.
 
@@ -66,6 +66,13 @@ contexts.
 
 Citation metrics are absent, not zero, when the answer cites nothing or no judge
 is available.
+
+A reasoning model as judge spends its output tokens reasoning before it
+answers. At RAGAS's limit of 1024 its judgements can be cut off; set
+`RAG_EVAL_JUDGE_MAX_TOKENS` higher, or turn its reasoning off with
+`RAG_EVAL_JUDGE_EXTRA_BODY` (see [configuration](../configuration.md)). The
+log counts the replies cut off that way, and so does the task's error when a
+metric is left with no score.
 
 ## Operational metrics
 

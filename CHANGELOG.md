@@ -8,7 +8,93 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **Four benchmarks load again, and a fifth says why it cannot.** `datasets`
+- **`wiki_multihop` loads from the XanhHo mirror with correct split mapping.** The
+  dataset now uses `hf_data_files` with `dev`, `train`, and `test` parquet files,
+  pinned to the resolved commit, and `hf_revision` so provenance is recorded.
+  Internal split names (`validation`) map to the mirror's `dev` split via
+  `split_mapping`, matching the convention used by `2wikimultihopqa`. The default
+  split is `"validation"` (not `"test"`) so ``load_benchmark("wiki_multihop")``
+  loads from the development split without specifying an argument. Added to
+  the pinned revisions set.
+
+- Contextual enrichment, graph extraction and RAPTOR call the configured LLM
+  provider, Ollama included, through one helper (`get_ingest_llm`). Each built
+  an OpenAI client of its own, so with only `OLLAMA_BASE_URL` set a
+  `max_quality` corpus was ingested with no context and no graph. Enrichment
+  also called a chat model's `generate` with a string and kept every chunk
+  unchanged; it now calls `invoke`. A chunk whose enrichment fails during a
+  benchmark is counted for the corpus and named in the bundle as a
+  `contextual_retrieval` fallback, which `lasagna results validate --strict`
+  refuses (#49).
+- **A reasoning model can generate (#114).** The harness's generator and every
+  loop asked for at most 1000 output tokens, and nothing raised it, so a
+  reasoning model's answer could come back empty, and a task failed with "could
+  not be generated" and no reason. `llm_max_tokens` (`RAG_LLM_MAX_TOKENS`, 1000
+  by default) is now the limit of every `get_llm` call that names none, the run
+  metadata records it, and a sweep arm cannot set it (every arm shares it). A
+  task's error says how many replies came back empty at their limit. In
+  `generation_only` mode an empty answer counts as failed (`generations_failed`;
+  past a tenth the task fails), as it already did live. To an OpenAI-compatible
+  provider (`ollama` without the `local` extra, `vllm`, `together` and the
+  others) the limit now goes as `max_tokens`: Ollama's `/v1` ignores the
+  `max_completion_tokens` that LangChain sends, so there an answer, and the
+  ingestion calls (contextual retrieval, RAPTOR, graph extraction), had no limit
+  at all and now have this one. A reasoning model there that answered before
+  can now stop at 1000 and fail its task until `RAG_LLM_MAX_TOKENS` is raised.
+  Their LLM cache entries miss once, as the request changed.
+- **An offline run no longer crashes in its judge (#117).** In
+  `generation_only` mode (`offline` before) the judge ran inside the event
+  loop, so RAGAS re-entered that loop through `nest_asyncio`, which could stop
+  the whole run with `IndexError: pop from an empty deque`. The judge now runs
+  in a thread, as it does on the live path; its spend still counts as the
+  judge's.
+- **`kilt/triviaqa` loads (#101).** The Hub's KILT publishes TriviaQA
+  (`triviaqa_support_only`) with its answers and support but without the
+  questions, so the benchmark never loaded. It now takes each row's question
+  from `mandarjoshi/trivia_qa` (`rc.wikipedia.nocontext`) by id, with both
+  datasets pinned, before sampling. Every row matches: 5,359 in `validation`
+  and 61,844 in `train`. KILT keeps its test answers hidden, so run it with
+  `--split validation`.
+- **A `speed`-profile arm that turns on a retrieval stage now runs it on the
+  generation track (#98).** Under `speed`, the generation track ran every
+  non-agentic arm at the `fast` tier, which turns off HyDE, reranking, hybrid
+  search, MMR, context reordering and hierarchical retrieval, so an arm that
+  turned one of them on answered from the control's passages. Such an arm now
+  runs its generation track at the `standard` tier, as its retrieval track
+  already did, and its generation numbers change. A plain `speed` arm keeps
+  `fast` and its numbers, and an arm that sets `enable_query_routing` or
+  `routing_default_tier` itself keeps its own routing. `system.routing_tiers`
+  records the tier each track ran on.
+- **A reasoning model can judge.** Qwen3, the DeepSeek-R1 distills and gpt-oss
+  reason before they answer, and RAGAS's limit of 1024 output tokens cut their
+  judgements off, so a generation run with one as judge failed with "judge
+  produced no usable scores" and no reason. `RAG_EVAL_JUDGE_MAX_TOKENS` raises
+  the limit, and the run metadata records it. A reply cut off is counted in the
+  log, and in the task's error when a metric is left with no score.
+  `RAG_EVAL_JUDGE_EXTRA_BODY` adds fields to every judge request, such as
+  `{"chat_template_kwargs": {"enable_thinking": false}}`, which turns Qwen3's
+  reasoning off on vLLM (`{"reasoning_effort": "none"}` on Ollama): with it on,
+  Qwen3-8B on vLLM sometimes answered `{}`. The check before answers are
+  written says the judge answered, cut off or with JSON that does not fit,
+  instead of blaming its credentials. Unset, the judge's requests are
+  unchanged. In `rag_overrides`, `docling_max_tokens`,
+  `query2doc_max_tokens` and `chunk_tokenizer` are no longer recorded as
+  `<redacted>`, so `--resume` tells their values apart, and a credential key
+  inside a JSON setting is hidden at any depth, not only at the top (#111).
+- **A generation experiment checks its judge before the first answer is written.**
+  `Experiment._run` and the CLI (`lasagna benchmark run`, `lasagna benchmark experiment`)
+  now validate the RAGAS judge once before corpus ingestion, checkpoint clearing, or
+  answer generation using its independent `RAG_EVAL_JUDGE_*` / `OPENAI_*`
+  configuration, while retrieval-only runs still do not probe the judge (#96).
+- Agentic reasoning and chunk-refinement LLM calls now honor the session's
+  `agent_temperature`, including shared and pinned loop models (#82). Previously,
+  `RAGConfig.agent_temperature` documented a default of `0.1` that never reached
+  any LLM call because models were built with the provider default (`0.0`). The
+  runtime default remains `0.0` so existing behavior does not silently change,
+  explicit session `agent_temperature` values now reach every reasoning and
+  chunk-refinement call, and adaptive complexity classification and CRAG
+  document grading remain deterministic at `0.0`.
+- **Four benchmarks load again.** `datasets`
   5, the version the release pins, refuses a Hub repository named without its
   owner, and since 4.0 it no longer runs loading scripts. `triviaqa`,
   `hotpotqa` and `kilt/nq` named `trivia_qa`, `hotpot_qa` and `kilt_tasks`,
@@ -18,9 +104,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   comparability keys do not change. FEVER loads the Hub's parquet conversion
   of its script, pinned to the commit that was checked, one split at a time,
   online or from the local cache. A dataset that does not load now says why,
-  instead of naming a split. `kilt/triviaqa` has never loaded: the Hub's KILT
-  has no `triviaqa` config, and the `triviaqa_support_only` it has carries no
-  questions. It now says so; the `triviaqa` benchmark has the questions.
+  instead of naming a split.
 - **An agentic arm under `speed` runs its loop.** `pipeline.query` forces the
   agentic tier for an arm that names an agentic pipeline, and the router
   dropped any forced tier whenever a profile turned query routing off. Under
@@ -37,6 +121,47 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a default tier other than `comprehensive` (of the built-in profiles,
   `speed`): for agentic arms, and for a CRAG arm that turned on a stage the
   fast tier turns off, such as a reranker.
+- **An agentic arm's exact match and F1 score its own answer.** The
+  generation track has the harness's generator answer from the passages each
+  search returned, so arms are compared on the same generator. For an agentic
+  arm the loop writes an answer too, and the judged metrics already scored it
+  (`faithfulness` was the loop's answer, `faithfulness_regen` the harness's).
+  Exact match, token F1, ROUGE-L, containment, abstention and answer
+  similarity scored only the harness's answer, so one row judged two answers,
+  and `lasagna results significance -m exact_match` compared the harness's
+  answers, not the loops. They now follow the judged metrics: the unsuffixed
+  key is the loop's answer where it gave one, `_regen` keeps the harness's,
+  `_agentic` is the loop's alone, and the loop's answer is saved with the
+  trajectory and shown in `lasagna results view` beside the harness's. A
+  question the loop answered no longer counts in `generations_failed` when
+  the harness's generator wrote nothing; `generations_failed_regen` counts
+  those. Numbers move for agentic arms only, and the metrics version is now
+  1.8, so results from earlier builds do not share a comparability key with
+  new ones.
+- **Self-Ask answers with a reasoning model.** A reasoning model served with
+  its thinking split off (Ollama's `think`, on by default for Qwen3; vLLM's
+  reasoning parser) applies a stop sequence to its reasoning too, and any of
+  Self-Ask's stops can end a reply there. Qwen3's reasoning opens with
+  `<think>` and a newline, so the newline stop on the final-answer call (made
+  when the chain ends without a final answer, as every question did once it
+  used its five follow-ups) ended the reply after two tokens, and the loop
+  answered nothing. A loop step whose stops leave the reply empty is now asked
+  once more without them and cut by the loop, after any blank lines it opens
+  with; a reply that opens with one of Self-Ask's markers is still empty. A
+  model whose replies the stops do not empty makes the same calls as before.
+- **A CHANGELOG line lands under Unreleased.** A branch started before a
+  release merges cleanly, but its line then sits under that release, so the
+  release notes claim a change the release never had. The "PR quality" check
+  now reads CHANGELOG.md as it will be once merged and fails while an added
+  line sits under a released version; a maintainer adds `changelog-history`
+  to correct a released version's notes.
+- The Compose stack's Qdrant service now raises its `nofile` ulimit to 524288.
+  A burst of eight clients creating collections and payload indexes exhausted
+  the container's default 1024 file descriptors ("Too many open files") and
+  could take the vector store down. Every other store service now has a
+  written decision, checked by `tests/test_compose_nofile_policy.py`: Milvus
+  holds at its default (measured), OpenSearch waits for its measurement, and
+  a new backend cannot inherit the default unnoticed.
 
 ## [0.3.0] - 2026-11-07
 
